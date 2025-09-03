@@ -1,0 +1,20 @@
+--------------
+SPDK
+--------------
+nvme list
+sudo scripts/setup.sh
+sudo scripts/setup.sh reset
+
+sudo ./build/bin/spdk_lspci
+sudo ./build/bin/spdk_bdevperf -q 1 -o 4096 -t 1 -d Nvme0n1
+
+-------------------
+Build spdk app
+-------------------
+gcc -o bdev_example bdev_example.c \
+    $(pkg-config --cflags --libs spdk_bdev spdk_env spdk_nvme spdk_util spdk_thread spdk_event)
+
+# without pkg-config
+gcc -o bdev_example bdev_example.c \
+    -I./include -L./build/lib \
+    -lspdk_bdev -lspdk_env_dpdk -lspdk_nvme -lsp
