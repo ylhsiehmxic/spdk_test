@@ -1,0 +1,42 @@
+我想觀察io channel的創建, 所以修改了原始碼增加了printf如下
+struct spdk_io_channel *
+spdk_get_io_channel(void *io_device)
+{
+	struct spdk_io_channel *ch;
+	struct spdk_thread *thread;
+	struct io_device *dev;
+	int rc;
+
+	dev = io_device_get(io_device);
+	thread = _get_thread();
+
+	ch = thread_get_io_channel(thread, dev);
+	if (ch != NULL) {
+		ch->ref++;
+		return ch;
+	}
+    printf("Create first io channel for thread %s with dev %s\n"), thread->name, dev->name);
+   ...
+}
+當我執行spdk_tgt程式, 然後執行
+./rpc.py bdev_nvme_attach_controller -b nvme1 ...
+在spdk_tgt的畫面印出了如下
+Create first io channel for thread app_thread with dev bev_nvme1n1
+Create first io channel for thread app_thread with dev nvme1n1
+Create first io channel for thread app_thread with dev nvme1
+Create first io channel for thread app_thread with dev nvme_poll_groups
+Create first io channel for thread app_thread with dev accel
+Create first io channel for thread app_thread with dev sw_accel_module
+Create first io channel for thread app_thread with dev iobuf
+Create first io channel for thread app_thread with dev bdev_mgr
+看來除了nvme1這層io_device, 還有其他多層, 說明介紹之
+
+----------------
+Q
+spdk_tgt程式執行後, 會看到它自動創建了nvmf_tgt_poll_group跟iscsi_poll_group, 但我還沒有掛載任何底層的nvmf或iscsi裝置上去呀？還是這是for上層, 提供target接點給app的？
+
+A
+這些 poll group 不是直接為底層 NVMe 或其他 bdev 創建的，而是為了「協定服務層」存在。Target 模組需要先有 poll group，才能準備接收外部 initiator 的連線。
+換句話說：
+poll group 提供「上層協定 → 下層 bdev」的橋接執行環境。
+即使底層沒有掛載裝置，target subsystem 也要先能「接客」。
