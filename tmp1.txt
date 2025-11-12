@@ -1,0 +1,19 @@
+# 啟用 hugepage
+sudo mkdir -p /dev/hugepages
+sudo mount -t hugetlbfs nodev /dev/hugepages
+sudo sysctl vm.nr_hugepages=1024
+
+# 建立 virtio-user bdev（client 端）
+在另一個終端（同一台機器上）：
+# 透過 UNIX socket 連到 vhost target
+sudo ./scripts/rpc.py bdev_virtio_attach_controller \
+    -t user -a /var/tmp/vhost.0 -d blk VirtioUser0
+
+/scripts/rpc.py bdev_get_bdevs
+會看到：
+  "name": "VirtioUser0",
+
+# .fio
+ioengine=spdk_bdev
+spdk_json_conf=/path/to/spdk/build/bin/spdk_tgt.sock
+filename=VirtioUser0
