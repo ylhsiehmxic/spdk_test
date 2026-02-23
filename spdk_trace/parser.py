@@ -2,96 +2,69 @@
 import argparse
 import csv
 import re
-from collections import OrderedDict
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple, Optional
 
-# core: ts  e.g. "0: 123.582"
-CORE_TS_RE = re.compile(r"^\s*(\d+)\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*$")
+EVENT_RE = re.compile(r"^[A-Z0-9_]+$")        # event_type like BDEV_IO_START
+CORE_TS_RE = re.compile(r"^(\d+):\s*([0-9]+(?:\.[0-9]+)?)$")  # "0: 123.582"
+PAREN_TOKEN_RE = re.compile(r"^\([^()]+\)$")  # "(R73)" "(i134)"
 
-# event_type usually looks like "BDEV_IO_START" / "BDEV_RAID_IO_DONE"
-EVENT_RE = re.compile(r"^[A-Z0-9_]+$")
+BASE_FIELDS = ["core", "ts", "event_type", "obj"]
+TIME_FIELD = "time"
 
-def split_ws(line: str) -> List[str]:
-    """Split by arbitrary whitespace (multiple spaces/tabs)."""
+def split_spaces(line: str) -> List[str]:
+    # Split by 1+ whitespace; preserves id values by later logic
     return re.findall(r"\S+", line.strip())
 
-def parse_core_ts(tokens: List[str]) -> Tuple[Optional[str], Optional[str], int]:
+def parse_one_line(line: str) -> Optional[Tuple[Dict[str, str], List[str]]]:
     """
-    Parse core and ts from the head tokens.
-    Supports either:
-      - token0 == "0:" and token1 == "123.582"
-      - token0 == "0:123.582" / "0: 123.582" (rare)
-    Returns (core, ts, next_index).
+    Returns:
+      row dict containing at least core/ts/event_type/obj (obj may be ""),
+      and a list of newly-seen keys in encounter order for header growth.
     """
-    if not tokens:
-        return None, None, 0
-
-    # Case A: "0:" "123.582"
-    if tokens[0].endswith(":") and len(tokens) >= 2:
-        core_part = tokens[0][:-1]
-        if core_part.isdigit() and re.match(r"^[0-9]+(?:\.[0-9]+)?$", tokens[1]):
-            return core_part, tokens[1], 2
-
-    # Case B: "0:123.582"
-    m = re.match(r"^(\d+):([0-9]+(?:\.[0-9]+)?)$", tokens[0])
-    if m:
-        return m.group(1), m.group(2), 1
-
-    # Case C: whole "0: 123.582" got merged into one token somehow
-    m2 = CORE_TS_RE.match(tokens[0])
-    if m2:
-        return m2.group(1), m2.group(2), 1
-
-    return None, None, 0
-
-def parse_line(line: str) -> Optional[Dict[str, str]]:
-    """
-    Parse one trace line into a dict with mandatory keys:
-      core, ts, event_type
-    Optional:
-      obj
-    Dynamic:
-      keys from "key:" "value" pairs
-    """
-    line = line.rstrip("\n")
-    if not line.strip():
+    line = line.strip()
+    if not line:
         return None
 
-    tokens = split_ws(line)
-    core, ts, i = parse_core_ts(tokens)
-    if core is None or ts is None:
-        return None  # not a trace line
+    toks = split_spaces(line)
+    if not toks:
+        return None
 
-    # Need event_type next; obj may exist.
-    if i >= len(tokens):
+    # First two tokens are: core:  ts
+    if len(toks) < 2:
+        return None
+    m = CORE_TS_RE.match(toks[0] + " " + toks[1])  # won't match; handle separately
+    # Actually toks[0] is "0:" and toks[1] is "123.582" in many outputs
+    # But sometimes it's "0:" "123.582" indeed; parse that directly:
+    if toks[0].endswith(":") and re.fullmatch(r"\d+", toks[0][:-1]) and re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", toks[1]):
+        core = toks[0][:-1]
+        ts = toks[1]
+        idx = 2
+    else:
+        # Or it might be a single token "0:"+"123.582" already combined (rare in your newer spec, but keep robust)
+        m2 = CORE_TS_RE.match(toks[0])
+        if not m2:
+            return None
+        core, ts = m2.group(1), m2.group(2)
+        idx = 1
+
+    # Next token(s): either [event_type] or [obj event_type]
+    if idx >= len(toks):
         return None
 
     obj = ""
     event_type = ""
 
-    # Strategy:
-    # - Find the first token that looks like EVENT_RE and is NOT endingwith ":" (to avoid "size:")
-    # - If the first candidate is at position i, then obj missing.
-    # - If candidate is at i+1, then tokens[i] is obj.
-    # - If further, we still handle: treat tokens before event as obj joined by space (rare but safe).
-    event_idx = None
-    for j in range(i, len(tokens)):
-        t = tokens[j]
-        if t.endswith(":"):
-            continue
-        if EVENT_RE.match(t):
-            event_idx = j
-            break
-
-    if event_idx is None:
-        return None
-
-    if event_idx == i:
-        event_type = tokens[i]
+    t = toks[idx]
+    if EVENT_RE.match(t):
+        event_type = t
+        idx += 1
     else:
-        # obj might be single token or multiple tokens (rare). Join them.
-        obj = " ".join(tokens[i:event_idx])
-        event_type = tokens[event_idx]
+        obj = t
+        idx += 1
+        if idx >= len(toks):
+            return None
+        event_type = toks[idx]
+        idx += 1
 
     row: Dict[str, str] = {
         "core": core,
@@ -100,77 +73,84 @@ def parse_line(line: str) -> Optional[Dict[str, str]]:
         "obj": obj,
     }
 
-    # Parse key/value pairs from tokens after event_idx
-    k = event_idx + 1
-    while k < len(tokens):
-        keytok = tokens[k]
-        if keytok.endswith(":"):
-            key = keytok[:-1]
-            # value is next token (if any)
-            if k + 1 < len(tokens):
-                val = tokens[k + 1]
-                row[key] = val
-                k += 2
-            else:
-                # dangling key without value
-                row[key] = ""
-                k += 1
-        else:
-            # stray token; skip
-            k += 1
+    new_keys: List[str] = []
 
-    return row
-
-def collect_rows_and_keys(fin) -> Tuple[List[Dict[str, str]], List[str]]:
-    rows: List[Dict[str, str]] = []
-    dyn_keys = OrderedDict()  # preserves first-seen order
-
-    for line in fin:
-        row = parse_line(line)
-        if row is None:
+    # Parse remaining tokens as key: value (space-separated, multiple spaces possible)
+    while idx < len(toks):
+        keytok = toks[idx]
+        if not keytok.endswith(":"):
+            idx += 1
             continue
-        rows.append(row)
-        for k in row.keys():
-            if k in ("core", "ts", "event_type", "obj"):
-                continue
-            if k == "time":
-                continue  # force time to the end later
-            if k not in dyn_keys:
-                dyn_keys[k] = True
 
-    return rows, list(dyn_keys.keys())
+        key = keytok[:-1]
+        idx += 1
+        if idx >= len(toks):
+            break
+
+        val = toks[idx]
+        idx += 1
+
+        # Special rule: id value may include a single "(...)" token after it
+        if key == "id" and idx < len(toks) and PAREN_TOKEN_RE.match(toks[idx]):
+            val = val + " " + toks[idx]
+            idx += 1
+
+        row[key] = val
+        new_keys.append(key)
+
+    return row, new_keys
 
 def main():
-    ap = argparse.ArgumentParser(description="Parse SPDK trace (whitespace-delimited) into dynamic-column CSV.")
-    ap.add_argument("input", help="Input trace file ('-' for stdin)")
-    ap.add_argument("-o", "--output", default="-", help="Output CSV file ('-' for stdout)")
+    ap = argparse.ArgumentParser(description="Parse SPDK trace (space-delimited) into dynamic CSV.")
+    ap.add_argument("input", help="Input trace file, or '-' for stdin")
+    ap.add_argument("-o", "--output", default="-", help="Output CSV file, or '-' for stdout")
     args = ap.parse_args()
 
-    inf = open(args.input, "r", encoding="utf-8", errors="replace") if args.input != "-" else None
-    outf = open(args.output, "w", newline="", encoding="utf-8") if args.output != "-" else None
+    fin = open(args.input, "r", encoding="utf-8", errors="replace") if args.input != "-" else None
+    fout = open(args.output, "w", newline="", encoding="utf-8") if args.output != "-" else None
+
+    rows: List[Dict[str, str]] = []
+    key_order: List[str] = []  # encounter order for non-base keys
+    seen_keys = set(BASE_FIELDS)
 
     try:
-        fin = inf if inf is not None else __import__("sys").stdin
-        fout = outf if outf is not None else __import__("sys").stdout
+        in_f = fin if fin is not None else __import__("sys").stdin
 
-        rows, dyn_keys = collect_rows_and_keys(fin)
+        for line in in_f:
+            parsed = parse_one_line(line)
+            if parsed is None:
+                continue
+            row, new_keys = parsed
+            rows.append(row)
+            for k in new_keys:
+                if k in seen_keys:
+                    continue
+                # We'll place TIME_FIELD at the end regardless, so track it but don't append now
+                if k == TIME_FIELD:
+                    seen_keys.add(k)
+                    continue
+                seen_keys.add(k)
+                key_order.append(k)
 
-        # Final field order:
-        # core,ts,event_type,obj, <dynamic keys>, time
-        fields = ["core", "ts", "event_type", "obj"] + dyn_keys + ["time"]
+        # Build header:
+        # core,ts,event_type,obj, <dynamic keys except time>, time(last if present)
+        header = BASE_FIELDS + key_order
+        if any(TIME_FIELD in r for r in rows):
+            header.append(TIME_FIELD)
 
-        w = csv.DictWriter(fout, fieldnames=fields)
+        out_f = fout if fout is not None else __import__("sys").stdout
+        w = csv.DictWriter(out_f, fieldnames=header)
         w.writeheader()
 
         for r in rows:
-            out = {f: r.get(f, "") for f in fields}
-            w.writerow(out)
+            out_row = {h: r.get(h, "") for h in header}
+            w.writerow(out_row)
 
     finally:
-        if inf is not None:
-            inf.close()
-        if outf is not None:
-            outf.close()
+        if fin is not None:
+            fin.close()
+        if fout is not None:
+            fout.close()
 
 if __name__ == "__main__":
     main()
