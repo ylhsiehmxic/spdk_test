@@ -5,140 +5,172 @@ import re
 from collections import OrderedDict
 from typing import Dict, List, Optional, Tuple
 
-# event token usually looks like BDEV_IO_START / BDEV_RAID_IO_DONE
+# core: ts  e.g. "0: 123.582"
+CORE_TS_RE = re.compile(r"^\s*(\d+)\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*$")
+
+# event_type usually looks like "BDEV_IO_START" / "BDEV_RAID_IO_DONE"
 EVENT_RE = re.compile(r"^[A-Z0-9_]+$")
 
-def _first_non_empty(tokens: List[str], start: int) -> Optional[int]:
-    for i in range(start, len(tokens)):
-        if tokens[i] != "":
-            return i
-    return None
+def split_ws(line: str) -> List[str]:
+    """Split by arbitrary whitespace (multiple spaces/tabs)."""
+    return re.findall(r"\S+", line.strip())
 
-def parse_trace_line(line: str) -> Optional[Tuple[Dict[str, str], OrderedDict]]:
+def parse_core_ts(tokens: List[str]) -> Tuple[Optional[str], Optional[str], int]:
     """
-    Returns:
-      - row dict containing at least core, ts, event_type, obj, plus any key/value pairs
-      - ordered_keys: OrderedDict of dynamic keys found in this row (preserves per-row discovery order)
+    Parse core and ts from the head tokens.
+    Supports either:
+      - token0 == "0:" and token1 == "123.582"
+      - token0 == "0:123.582" / "0: 123.582" (rare)
+    Returns (core, ts, next_index).
+    """
+    if not tokens:
+        return None, None, 0
+
+    # Case A: "0:" "123.582"
+    if tokens[0].endswith(":") and len(tokens) >= 2:
+        core_part = tokens[0][:-1]
+        if core_part.isdigit() and re.match(r"^[0-9]+(?:\.[0-9]+)?$", tokens[1]):
+            return core_part, tokens[1], 2
+
+    # Case B: "0:123.582"
+    m = re.match(r"^(\d+):([0-9]+(?:\.[0-9]+)?)$", tokens[0])
+    if m:
+        return m.group(1), m.group(2), 1
+
+    # Case C: whole "0: 123.582" got merged into one token somehow
+    m2 = CORE_TS_RE.match(tokens[0])
+    if m2:
+        return m2.group(1), m2.group(2), 1
+
+    return None, None, 0
+
+def parse_line(line: str) -> Optional[Dict[str, str]]:
+    """
+    Parse one trace line into a dict with mandatory keys:
+      core, ts, event_type
+    Optional:
+      obj
+    Dynamic:
+      keys from "key:" "value" pairs
     """
     line = line.rstrip("\n")
     if not line.strip():
         return None
 
-    # split by TAB; preserve empty tokens from consecutive tabs
-    tokens = line.split("\t")
+    tokens = split_ws(line)
+    core, ts, i = parse_core_ts(tokens)
+    if core is None or ts is None:
+        return None  # not a trace line
 
-    i0 = _first_non_empty(tokens, 0)
-    if i0 is None:
+    # Need event_type next; obj may exist.
+    if i >= len(tokens):
         return None
 
-    # Expect "0: 123.582"
-    m = re.match(r"^\s*(\d+)\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*$", tokens[i0].strip())
-    if not m:
-        return None
-
-    core = m.group(1)
-    ts = m.group(2)
-
-    # Next non-empty token: could be obj or event
-    i1 = _first_non_empty(tokens, i0 + 1)
-    if i1 is None:
-        return ({"core": core, "ts": ts, "event_type": "", "obj": ""}, OrderedDict())
-
-    t1 = tokens[i1].strip()
     obj = ""
     event_type = ""
-    idx_after_event = i1 + 1
 
-    if EVENT_RE.match(t1):
-        # No obj
-        event_type = t1
-    else:
-        obj = t1
-        i2 = _first_non_empty(tokens, i1 + 1)
-        if i2 is None:
-            return ({"core": core, "ts": ts, "event_type": "", "obj": obj}, OrderedDict())
-        event_type = tokens[i2].strip()
-        idx_after_event = i2 + 1
-
-    row: Dict[str, str] = {"core": core, "ts": ts, "event_type": event_type, "obj": obj}
-    found_keys_in_row: "OrderedDict[str, None]" = OrderedDict()
-
-    # Parse key/value pairs: key token endswith ":" and value token is next non-empty token
-    i = idx_after_event
-    while i < len(tokens):
-        if tokens[i] == "":
-            i += 1
+    # Strategy:
+    # - Find the first token that looks like EVENT_RE and is NOT endingwith ":" (to avoid "size:")
+    # - If the first candidate is at position i, then obj missing.
+    # - If candidate is at i+1, then tokens[i] is obj.
+    # - If further, we still handle: treat tokens before event as obj joined by space (rare but safe).
+    event_idx = None
+    for j in range(i, len(tokens)):
+        t = tokens[j]
+        if t.endswith(":"):
             continue
+        if EVENT_RE.match(t):
+            event_idx = j
+            break
 
-        keytok = tokens[i].strip()
+    if event_idx is None:
+        return None
+
+    if event_idx == i:
+        event_type = tokens[i]
+    else:
+        # obj might be single token or multiple tokens (rare). Join them.
+        obj = " ".join(tokens[i:event_idx])
+        event_type = tokens[event_idx]
+
+    row: Dict[str, str] = {
+        "core": core,
+        "ts": ts,
+        "event_type": event_type,
+        "obj": obj,
+    }
+
+    # Parse key/value pairs from tokens after event_idx
+    k = event_idx + 1
+    while k < len(tokens):
+        keytok = tokens[k]
         if keytok.endswith(":"):
-            key = keytok[:-1].strip()
-            j = _first_non_empty(tokens, i + 1)
-            if j is None:
-                break
-            val = tokens[j].strip()
-
-            # store
-            row[key] = val
-            found_keys_in_row[key] = None
-
-            i = j + 1
+            key = keytok[:-1]
+            # value is next token (if any)
+            if k + 1 < len(tokens):
+                val = tokens[k + 1]
+                row[key] = val
+                k += 2
+            else:
+                # dangling key without value
+                row[key] = ""
+                k += 1
         else:
-            i += 1
+            # stray token; skip
+            k += 1
 
-    return row, found_keys_in_row
+    return row
 
-def build_header(dynamic_key_order: "OrderedDict[str, None]") -> List[str]:
-    # core,ts,event_type,obj + dynamic keys (except time) + time at end
-    fixed_prefix = ["core", "ts", "event_type", "obj"]
-    keys = list(dynamic_key_order.keys())
+def collect_rows_and_keys(fin) -> Tuple[List[Dict[str, str]], List[str]]:
+    rows: List[Dict[str, str]] = []
+    dyn_keys = OrderedDict()  # preserves first-seen order
 
-    # remove duplicates of fixed fields if any weird input includes them as keys
-    keys = [k for k in keys if k not in fixed_prefix]
+    for line in fin:
+        row = parse_line(line)
+        if row is None:
+            continue
+        rows.append(row)
+        for k in row.keys():
+            if k in ("core", "ts", "event_type", "obj"):
+                continue
+            if k == "time":
+                continue  # force time to the end later
+            if k not in dyn_keys:
+                dyn_keys[k] = True
 
-    # keep time last if it exists
-    middle = [k for k in keys if k != "time"]
-    header = fixed_prefix + middle + ["time"]
-    return header
+    return rows, list(dyn_keys.keys())
 
 def main():
-    ap = argparse.ArgumentParser(description="Parse SPDK spdk_trace text (TAB-delimited) into CSV with dynamic columns.")
-    ap.add_argument("input", help="Input trace text file (use - for stdin)")
-    ap.add_argument("-o", "--output", default="-", help="Output CSV file (default: stdout)")
+    ap = argparse.ArgumentParser(description="Parse SPDK trace (whitespace-delimited) into dynamic-column CSV.")
+    ap.add_argument("input", help="Input trace file ('-' for stdin)")
+    ap.add_argument("-o", "--output", default="-", help="Output CSV file ('-' for stdout)")
     args = ap.parse_args()
 
-    # We need 2-pass (or store rows) to know all keys before writing CSV header.
-    rows: List[Dict[str, str]] = []
-    dynamic_key_order: "OrderedDict[str, None]" = OrderedDict()
+    inf = open(args.input, "r", encoding="utf-8", errors="replace") if args.input != "-" else None
+    outf = open(args.output, "w", newline="", encoding="utf-8") if args.output != "-" else None
 
-    fin = open(args.input, "r", encoding="utf-8", errors="replace") if args.input != "-" else __import__("sys").stdin
-    for line in fin:
-        parsed = parse_trace_line(line)
-        if parsed is None:
-            continue
-        row, found_keys = parsed
-        rows.append(row)
-        # global key discovery order (first time ever seen wins)
-        for k in found_keys.keys():
-            if k not in dynamic_key_order:
-                dynamic_key_order[k] = None
+    try:
+        fin = inf if inf is not None else __import__("sys").stdin
+        fout = outf if outf is not None else __import__("sys").stdout
 
-    if args.input != "-":
-        fin.close()
+        rows, dyn_keys = collect_rows_and_keys(fin)
 
-    header = build_header(dynamic_key_order)
+        # Final field order:
+        # core,ts,event_type,obj, <dynamic keys>, time
+        fields = ["core", "ts", "event_type", "obj"] + dyn_keys + ["time"]
 
-    fout = open(args.output, "w", newline="", encoding="utf-8") if args.output != "-" else __import__("sys").stdout
-    w = csv.DictWriter(fout, fieldnames=header, extrasaction="ignore")
-    w.writeheader()
+        w = csv.DictWriter(fout, fieldnames=fields)
+        w.writeheader()
 
-    for row in rows:
-        # Ensure all header fields exist
-        out = {k: row.get(k, "") for k in header}
-        w.writerow(out)
+        for r in rows:
+            out = {f: r.get(f, "") for f in fields}
+            w.writerow(out)
 
-    if args.output != "-":
-        fout.close()
+    finally:
+        if inf is not None:
+            inf.close()
+        if outf is not None:
+            outf.close()
 
 if __name__ == "__main__":
     main()
