@@ -78,4 +78,22 @@ def parse_line(line: str) -> Optional[Dict[str, str]]:
 
 def main():
     # stdin 或檔案
-    if len
+    if len(sys.argv) > 1:
+        f = open(sys.argv[1], "r", encoding="utf-8", errors="replace")
+    else:
+        f = sys.stdin
+
+    writer = csv.DictWriter(sys.stdout, fieldnames=OUT_FIELDS, lineterminator="\n")
+    writer.writeheader()
+
+    for line in f:
+        row = parse_line(line)
+        if row is not None:
+            writer.writerow(row)
+
+    if f is not sys.stdin:
+        f.close()
+
+
+if __name__ == "__main__":
+    main()
