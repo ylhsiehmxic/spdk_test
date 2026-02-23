@@ -4,67 +4,63 @@ import csv
 import re
 from typing import Dict, List, Tuple, Optional
 
-EVENT_RE = re.compile(r"^[A-Z0-9_]+$")        # event_type like BDEV_IO_START
-CORE_TS_RE = re.compile(r"^(\d+):\s*([0-9]+(?:\.[0-9]+)?)$")  # "0: 123.582"
-PAREN_TOKEN_RE = re.compile(r"^\([^()]+\)$")  # "(R73)" "(i134)"
+# event_type 通常像 BDEV_IO_START / BDEV_RAID_IO_DONE
+EVENT_RE = re.compile(r"^[A-Z0-9_]+$")
 
-BASE_FIELDS = ["core", "ts", "event_type", "obj"]
-TIME_FIELD = "time"
+# 找 key: 的 regex（key 允許底線/數字）
+KEY_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*:")
 
-def split_spaces(line: str) -> List[str]:
-    # Split by 1+ whitespace; preserves id values by later logic
-    return re.findall(r"\S+", line.strip())
+# 行首 core: ts
+HEAD_RE = re.compile(r"^\s*(\d+)\s*:\s*([0-9]+(?:\.[0-9]+)?)\s+")
+
+BASE_COLS = ["core", "ts", "event_type", "obj"]
 
 def parse_one_line(line: str) -> Optional[Tuple[Dict[str, str], List[str]]]:
     """
-    Returns:
-      row dict containing at least core/ts/event_type/obj (obj may be ""),
-      and a list of newly-seen keys in encounter order for header growth.
+    Return: (row_dict, keys_seen_in_this_line)
+    row_dict includes base cols and any parsed key/value.
     """
-    line = line.strip()
-    if not line:
+    s = line.rstrip("\n")
+    if not s.strip():
         return None
 
-    toks = split_spaces(line)
-    if not toks:
+    m = HEAD_RE.match(s)
+    if not m:
         return None
 
-    # First two tokens are: core:  ts
-    if len(toks) < 2:
-        return None
-    m = CORE_TS_RE.match(toks[0] + " " + toks[1])  # won't match; handle separately
-    # Actually toks[0] is "0:" and toks[1] is "123.582" in many outputs
-    # But sometimes it's "0:" "123.582" indeed; parse that directly:
-    if toks[0].endswith(":") and re.fullmatch(r"\d+", toks[0][:-1]) and re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", toks[1]):
-        core = toks[0][:-1]
-        ts = toks[1]
-        idx = 2
-    else:
-        # Or it might be a single token "0:"+"123.582" already combined (rare in your newer spec, but keep robust)
-        m2 = CORE_TS_RE.match(toks[0])
-        if not m2:
-            return None
-        core, ts = m2.group(1), m2.group(2)
-        idx = 1
+    core, ts = m.group(1), m.group(2)
+    rest = s[m.end():]
 
-    # Next token(s): either [event_type] or [obj event_type]
-    if idx >= len(toks):
-        return None
+    # 找出 rest 中所有 key: 的位置
+    km = list(KEY_RE.finditer(rest))
+    first_key_pos = km[0].start() if km else len(rest)
 
-    obj = ""
+    # key: 之前的部分 -> 用來抽 obj + event_type
+    prefix = rest[:first_key_pos].strip()
+    prefix_tokens = prefix.split() if prefix else []
+
     event_type = ""
+    obj = ""
 
-    t = toks[idx]
-    if EVENT_RE.match(t):
-        event_type = t
-        idx += 1
-    else:
-        obj = t
-        idx += 1
-        if idx >= len(toks):
-            return None
-        event_type = toks[idx]
-        idx += 1
+    if prefix_tokens:
+        # 假設 event_type 是 prefix 最後一個 token，且通常是全大寫底線
+        if EVENT_RE.match(prefix_tokens[-1]):
+            event_type = prefix_tokens[-1]
+            obj = " ".join(prefix_tokens[:-1]).strip()
+        else:
+            # fallback：找最後一個像 event 的 token
+            idx = -1
+            for i in range(len(prefix_tokens)-1, -1, -1):
+                if EVENT_RE.match(prefix_tokens[i]):
+                    idx = i
+                    break
+            if idx >= 0:
+                event_type = prefix_tokens[idx]
+                obj = " ".join(prefix_tokens[:idx]).strip()
+            else:
+                # 真的找不到 event，就先塞到 event_type，obj 留空
+                event_type = prefix_tokens[-1]
+                obj = " ".join(prefix_tokens[:-1]).strip()
 
     row: Dict[str, str] = {
         "core": core,
@@ -73,84 +69,86 @@ def parse_one_line(line: str) -> Optional[Tuple[Dict[str, str], List[str]]]:
         "obj": obj,
     }
 
-    new_keys: List[str] = []
+    keys_seen: List[str] = []
 
-    # Parse remaining tokens as key: value (space-separated, multiple spaces possible)
-    while idx < len(toks):
-        keytok = toks[idx]
-        if not keytok.endswith(":"):
-            idx += 1
+    # 用「key: 的位置切片」抓 value（value = key_end ~ next_key_start）
+    for i, kmatch in enumerate(km):
+        key = kmatch.group(1)
+        # value 起點：冒號後（允許冒號後有空白）
+        val_start = kmatch.end()
+        val_end = km[i + 1].start() if i + 1 < len(km) else len(rest)
+        value = rest[val_start:val_end].strip()
+
+        # 你提到 id value 允許有一次括號：i232 (R73) / R73 (i134)
+        # 這裡不強制格式，只是「允許有空白」；若你想要嚴格驗證可打開下面檢查
+        # if key == "id":
+        #     if not re.match(r"^\S+(?:\s+\(\S+\))?$", value):
+        #         pass  # 不符合也照收，避免漏資料
+
+        # 記錄
+        row[key] = value
+        keys_seen.append(key)
+
+    return row, keys_seen
+
+
+def build_header(all_keys: List[str]) -> List[str]:
+    # 固定：time 欄位最後
+    keys = []
+    for k in all_keys:
+        if k in BASE_COLS or k == "time":
             continue
+        keys.append(k)
+    # 保持出現順序（all_keys 已經是依出現順序加入）
+    header = BASE_COLS + keys
+    header.append("time")
+    return header
 
-        key = keytok[:-1]
-        idx += 1
-        if idx >= len(toks):
-            break
-
-        val = toks[idx]
-        idx += 1
-
-        # Special rule: id value may include a single "(...)" token after it
-        if key == "id" and idx < len(toks) and PAREN_TOKEN_RE.match(toks[idx]):
-            val = val + " " + toks[idx]
-            idx += 1
-
-        row[key] = val
-        new_keys.append(key)
-
-    return row, new_keys
 
 def main():
-    ap = argparse.ArgumentParser(description="Parse SPDK trace (space-delimited) into dynamic CSV.")
-    ap.add_argument("input", help="Input trace file, or '-' for stdin")
+    ap = argparse.ArgumentParser(description="Parse SPDK trace text into CSV with dynamic columns.")
+    ap.add_argument("input", help="Input trace text file, or '-' for stdin")
     ap.add_argument("-o", "--output", default="-", help="Output CSV file, or '-' for stdout")
     args = ap.parse_args()
 
-    fin = open(args.input, "r", encoding="utf-8", errors="replace") if args.input != "-" else None
-    fout = open(args.output, "w", newline="", encoding="utf-8") if args.output != "-" else None
+    fin = open(args.input, "r", encoding="utf-8", errors="replace") if args.input != "-" else __import__("sys").stdin
+    lines = fin.readlines() if fin is not __import__("sys").stdin else fin.read().splitlines(True)
+    if fin is not __import__("sys").stdin:
+        fin.close()
 
     rows: List[Dict[str, str]] = []
-    key_order: List[str] = []  # encounter order for non-base keys
-    seen_keys = set(BASE_FIELDS)
+    all_keys_in_order: List[str] = []
 
-    try:
-        in_f = fin if fin is not None else __import__("sys").stdin
+    seen_set = set(BASE_COLS)  # base cols 視為已知
+    seen_set.add("time")       # time 也預留（最後輸出）
 
-        for line in in_f:
-            parsed = parse_one_line(line)
-            if parsed is None:
-                continue
-            row, new_keys = parsed
-            rows.append(row)
-            for k in new_keys:
-                if k in seen_keys:
-                    continue
-                # We'll place TIME_FIELD at the end regardless, so track it but don't append now
-                if k == TIME_FIELD:
-                    seen_keys.add(k)
-                    continue
-                seen_keys.add(k)
-                key_order.append(k)
+    for line in lines:
+        parsed = parse_one_line(line)
+        if not parsed:
+            continue
+        row, keys_seen = parsed
+        rows.append(row)
+        for k in keys_seen:
+            if k not in seen_set:
+                seen_set.add(k)
+                all_keys_in_order.append(k)
 
-        # Build header:
-        # core,ts,event_type,obj, <dynamic keys except time>, time(last if present)
-        header = BASE_FIELDS + key_order
-        if any(TIME_FIELD in r for r in rows):
-            header.append(TIME_FIELD)
+    header = build_header(all_keys_in_order)
 
-        out_f = fout if fout is not None else __import__("sys").stdout
-        w = csv.DictWriter(out_f, fieldnames=header)
-        w.writeheader()
+    fout = open(args.output, "w", newline="", encoding="utf-8") if args.output != "-" else __import__("sys").stdout
+    w = csv.DictWriter(fout, fieldnames=header)
+    w.writeheader()
 
-        for r in rows:
-            out_row = {h: r.get(h, "") for h in header}
-            w.writerow(out_row)
+    for r in rows:
+        out = {h: r.get(h, "") for h in header}
+        # 保證 time 沒出現也空著
+        if "time" not in out:
+            out["time"] = ""
+        w.writerow(out)
 
-    finally:
-        if fin is not None:
-            fin.close()
-        if fout is not None:
-            fout.close()
+    if fout is not __import__("sys").stdout:
+        fout.close()
+
 
 if __name__ == "__main__":
     main()
