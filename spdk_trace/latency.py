@@ -38,13 +38,19 @@ def main():
     ap.add_argument("-o", "--output", default="analysis.csv", help="Output analysis CSV")
     ap.add_argument("--max-gap-us", type=float, default=5000.0,
                     help="Max allowed time gap (us) when matching root start/done around raid interval (default 5000us)")
+    ap.add_argument("--skip", type=int, default=0,
+                help="Skip first N data rows (after header) from input CSV")
     args = ap.parse_args()
 
     # 讀入所有 rows
     rows: List[Dict[str, str]] = []
     with open(args.csv_in, "r", encoding="utf-8", errors="replace") as f:
         r = csv.DictReader(f)
+        skipped = 0
         for row in r:
+            if skipped < args.skip:
+                skipped += 1
+                continue
             # 必備欄位：core, ts, event_type
             if not row.get("core") or not row.get("ts") or not row.get("event_type"):
                 continue
