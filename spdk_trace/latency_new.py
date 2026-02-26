@@ -62,8 +62,10 @@ def main():
     # 找最後一次 id == N/A 的 row index（1-based）
     last_na_idx = 0
     last_na_row: Optional[Dict[str, str]] = None
+    FOCUS_EVENTS = {E_BDEV_START, E_BDEV_DONE, E_RAID_START, E_RAID_DONE}
     for i, row in enumerate(rows, start=1):
-        if is_na_id(row.get("id", "")):
+        evt = (row.get("event_type") or "").strip()
+        if evt in FOCUS_EVENTS and is_na_id(row.get("id", "")):
             last_na_idx = i
             last_na_row = row
 
