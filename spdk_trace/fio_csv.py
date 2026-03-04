@@ -128,7 +128,6 @@ def process_file(path: str) -> Optional[Dict[str, Any]]:
         "qd": meta["qd"],
         "bs": meta["bs"],
         "bw": bw,  # MiB/s
-        "latency_unit": lat[0] if lat else None,  # original unit name
         "avg": lat[1] if lat else None,   # usec
         "min": lat[2] if lat else None,   # usec
         "max": lat[3] if lat else None,   # usec
@@ -157,7 +156,7 @@ def main():
             rows.append(r)
 
     # Output columns (as you requested)
-    fieldnames = ["cores", "wowi", "rw", "qd", "bs", "bw", "latency_unit", "avg", "min", "max", "stdev"]
+    fieldnames = ["cores", "wowi", "rw", "qd", "bs", "bw", "avg", "min", "max", "stdev"]
 
     with open(args.output, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
