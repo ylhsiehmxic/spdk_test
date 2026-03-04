@@ -34,7 +34,6 @@ def parse_metric_scale_pairs(argv: List[str]) -> Tuple[List[Tuple[str, str]], Li
                 raise SystemExit("ERROR: --set needs a metric name, e.g. --set bw")
             metric = argv[i + 1]
             i += 2
-            # expect --yscale next
             if i >= len(argv) or argv[i] != "--yscale":
                 raise SystemExit(f"ERROR: after --set {metric}, you must provide --yscale linear|log10")
             if i + 1 >= len(argv):
@@ -54,18 +53,16 @@ def parse_metric_scale_pairs(argv: List[str]) -> Tuple[List[Tuple[str, str]], Li
 # Sorting helpers (numeric semantics)
 # -------------------------
 SIZE_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([kKmMgGtT])?\s*(i?[bB])?\s*$")
-# examples:
-#   "4K" "16K" "1M" "512" "512k" "2GiB" (we’ll treat K/M/G as 1024-based for bs-like)
+
+
 def parse_size_like_to_number(v: Any) -> Optional[float]:
     if v is None or (isinstance(v, float) and np.isnan(v)):
         return None
 
-    # already numeric
     if isinstance(v, (int, float, np.integer, np.floating)) and not isinstance(v, bool):
         return float(v)
 
     s = str(v).strip()
-    # pure int/float string
     try:
         return float(s)
     except Exception:
@@ -106,7 +103,7 @@ def transform_values(vals: np.ndarray, scale: str) -> np.ndarray:
     vals = np.asarray(vals, dtype=float)
     if scale == "linear":
         return vals
-    # log10: keep 0 as 0 (so missing/0 doesn't explode), otherwise log10(v)
+    # log10: keep <=0 as 0 so bars still render
     out = np.zeros_like(vals)
     mask = vals > 0
     out[mask] = np.log10(vals[mask])
@@ -128,18 +125,10 @@ def plot_grouped_bar(
     title: str,
     out_png: str,
     agg: str = "mean",
-):
-    """
-    Make one grouped bar chart for one (row_val, col_val) cell.
-    - group_col: legend group
-    - x_col: x categories
-    - y_col: metric
-    - agg: if duplicates exist for same (group, x), aggregate
-    """
+) -> bool:
     if subset.empty:
         return False
 
-    # aggregate to one value per (group, x)
     if agg == "mean":
         pivot = subset.groupby([group_col, x_col], dropna=False)[y_col].mean().reset_index()
     elif agg == "max":
@@ -149,7 +138,6 @@ def plot_grouped_bar(
     else:
         raise ValueError(f"Unsupported agg: {agg}")
 
-    # build matrix [groups x xvals]
     mat = np.zeros((len(all_groups), len(all_xvals)), dtype=float)
     lookup: Dict[Tuple[Any, Any], float] = {}
     for _, r in pivot.iterrows():
@@ -170,14 +158,10 @@ def plot_grouped_bar(
         ax.bar(pos, mat_t[gi, :], width, label=str(g))
 
     ax.set_xticks(xbase + width * (len(all_groups) - 1) / 2 if len(all_groups) > 1 else xbase)
-    ax.set_xticklabels([str(v) for v in all_xvals], rotation=0)
+    ax.set_xticklabels([str(v) for v in all_xvals])
+
     ax.set_xlabel(x_col)
-
-    if yscale == "linear":
-        ax.set_ylabel(y_col)
-    else:
-        ax.set_ylabel(f"log10({y_col})")
-
+    ax.set_ylabel(y_col if yscale == "linear" else f"log10({y_col})")
     ax.set_ylim(0, global_ymax)
     ax.set_title(title)
     ax.legend(fontsize=8, ncol=min(4, max(1, len(all_groups))))
@@ -208,7 +192,6 @@ def build_html_table(
     html.append(f"<h2>Metric: {metric_name} &nbsp;&nbsp; Scale: {scale}</h2>")
     html.append("<table>")
 
-    # header row
     html.append("<tr>")
     html.append(f"<th>{row_field} \\ {col_field}</th>")
     for c in cols:
@@ -221,7 +204,6 @@ def build_html_table(
         for c in cols:
             img = cell_img.get((r, c))
             if img:
-                # tooltip shows which cell it is
                 html.append(f"<td><img src='{img}' width='520' title='{row_field}={r}, {col_field}={c}'></td>")
             else:
                 html.append("<td></td>")
@@ -233,10 +215,37 @@ def build_html_table(
         f.write("\n".join(html))
 
 
+# -------------------------
+# Scope filtering
+# -------------------------
+def apply_scopes(df: pd.DataFrame, scopes: List[Tuple[str, str]]) -> pd.DataFrame:
+    """
+    scopes: list of (col, value)
+    Keep rows where df[col] == value for all scope pairs.
+    Comparison:
+      - if df[col] is numeric, compare numerically when possible
+      - else compare as string
+    """
+    out = df
+    for col, val in scopes:
+        if col not in out.columns:
+            raise SystemExit(f"ERROR: scope column not found in CSV: {col}")
+
+        series = out[col]
+        # Try numeric compare if possible
+        val_num = parse_size_like_to_number(val)
+        if pd.api.types.is_numeric_dtype(series) and val_num is not None:
+            out = out[series.astype(float) == float(val_num)]
+        else:
+            out = out[series.astype(str) == str(val)]
+    return out
+
+
 def main():
     pairs, rest = parse_metric_scale_pairs(sys.argv[1:])
 
     ap = argparse.ArgumentParser(description="Generate grouped bar charts + HTML dashboard from fio_summary.csv")
+
     ap.add_argument("--csv", required=True, help="input CSV")
     ap.add_argument("--group", required=True, help="group column (legend)")
     ap.add_argument("--x", required=True, help="x-axis column")
@@ -244,14 +253,30 @@ def main():
     ap.add_argument("--col", required=True, help="HTML table col column")
     ap.add_argument("--outdir", default="images", help="output dir (default: images)")
     ap.add_argument("--agg", choices=["mean", "max", "min"], default="mean", help="aggregate duplicates (default: mean)")
+
+    # scopes: can repeat
+    ap.add_argument("--scope", action="append", default=[], help="filter column name (repeatable)")
+    ap.add_argument("--scope_value", action="append", default=[], help="filter value (repeatable)")
+
     args = ap.parse_args(rest)
 
     if not pairs:
         raise SystemExit("ERROR: you must specify at least one metric set, e.g. --set bw --yscale linear")
 
+    if len(args.scope) != len(args.scope_value):
+        raise SystemExit("ERROR: --scope and --scope_value must appear in pairs (same count).")
+
+    scopes = list(zip(args.scope, args.scope_value))
+
     df = pd.read_csv(args.csv)
 
-    # validate required columns exist
+    # Apply scope filters early
+    if scopes:
+        df = apply_scopes(df, scopes)
+
+    if df.empty:
+        raise SystemExit("ERROR: after applying scope filters, no rows remain.")
+
     need_cols = {args.group, args.x, args.row, args.col}
     metric_cols = {m for (m, _) in pairs}
     missing = [c for c in list(need_cols | metric_cols) if c not in df.columns]
@@ -263,15 +288,13 @@ def main():
         shutil.rmtree(args.outdir)
     os.makedirs(args.outdir, exist_ok=True)
 
-    # sort axes values numerically (qd/cores/bs will be handled by size parser)
+    # sorted axes values (numeric semantics)
     all_groups = smart_sorted(df[args.group].dropna().unique().tolist())
     all_xvals = smart_sorted(df[args.x].dropna().unique().tolist())
     all_rows = smart_sorted(df[args.row].dropna().unique().tolist())
     all_cols = smart_sorted(df[args.col].dropna().unique().tolist())
 
-    # For each metric, compute global ymax AFTER transform, so all plots share y-range.
-    # Note: for log10, values <=0 become 0.
-    dashboards = []  # list of (metric, scale, html_path)
+    dashboards = []
 
     for metric, scale in pairs:
         vals = df[metric].to_numpy(dtype=float)
@@ -292,7 +315,10 @@ def main():
                 safe_c = str(c).replace("/", "_")
                 out_png = os.path.join(args.outdir, f"{metric}_{scale}_{args.row}_{safe_r}_{args.col}_{safe_c}.png")
 
-                title = f"{args.row}={r}, {args.col}={c}"
+                # add scope info into title (useful when you filter)
+                scope_str = ", ".join([f"{k}={v}" for k, v in scopes]) if scopes else ""
+                title = f"{args.row}={r}, {args.col}={c}" + (f" [{scope_str}]" if scope_str else "")
+
                 ok = plot_grouped_bar(
                     subset=subset,
                     group_col=args.group,
@@ -307,7 +333,6 @@ def main():
                     agg=args.agg,
                 )
                 if ok:
-                    # store path relative to html (same dir), so just basename is ok
                     cell_img[(r, c)] = os.path.basename(out_png)
 
         out_html = os.path.join(args.outdir, f"dashboard_{metric}_{scale}.html")
@@ -323,10 +348,12 @@ def main():
         )
         dashboards.append((metric, scale, out_html))
 
-    # index page linking all dashboards
+    # index page
     index = []
     index.append("<html><head><meta charset='utf-8'></head><body>")
     index.append("<h1>FIO Dashboards</h1>")
+    if scopes:
+        index.append("<p><b>Scope:</b> " + ", ".join([f"{k}={v}" for k, v in scopes]) + "</p>")
     index.append("<ul>")
     for metric, scale, htmlp in dashboards:
         base = os.path.basename(htmlp)
