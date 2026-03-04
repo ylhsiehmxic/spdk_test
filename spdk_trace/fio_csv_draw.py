@@ -1,165 +1,345 @@
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import os
-import argparse
+import sys
+import re
 import shutil
+import argparse
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from typing import Any, List, Tuple, Optional, Dict
 
-parser = argparse.ArgumentParser()
 
-parser.add_argument("--csv", required=True)
+# -------------------------
+# Parsing: repeated --set metric --yscale scale (interleaved)
+# -------------------------
+def parse_metric_scale_pairs(argv: List[str]) -> Tuple[List[Tuple[str, str]], List[str]]:
+    """
+    Accepts interleaved tokens like:
+      --set bw --yscale linear --set avg --yscale log10
 
-parser.add_argument("--group", required=True)
-parser.add_argument("--x", required=True)
+    Returns:
+      pairs: [("bw","linear"), ("avg","log10"), ...]
+      remaining_argv: argv with those tokens removed (so argparse can parse the rest)
+    """
+    pairs: List[Tuple[str, str]] = []
+    out: List[str] = []
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--set":
+            if i + 1 >= len(argv):
+                raise SystemExit("ERROR: --set needs a metric name, e.g. --set bw")
+            metric = argv[i + 1]
+            i += 2
+            # expect --yscale next
+            if i >= len(argv) or argv[i] != "--yscale":
+                raise SystemExit(f"ERROR: after --set {metric}, you must provide --yscale linear|log10")
+            if i + 1 >= len(argv):
+                raise SystemExit("ERROR: --yscale needs a value: linear or log10")
+            scale = argv[i + 1].lower()
+            if scale not in ("linear", "log10"):
+                raise SystemExit(f"ERROR: invalid --yscale {scale}, use linear or log10")
+            pairs.append((metric, scale))
+            i += 2
+        else:
+            out.append(tok)
+            i += 1
+    return pairs, out
 
-parser.add_argument("--row", required=True)
-parser.add_argument("--col", required=True)
 
-parser.add_argument("--yscale", choices=["linear","log10"], default="linear")
+# -------------------------
+# Sorting helpers (numeric semantics)
+# -------------------------
+SIZE_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([kKmMgGtT])?\s*(i?[bB])?\s*$")
+# examples:
+#   "4K" "16K" "1M" "512" "512k" "2GiB" (we’ll treat K/M/G as 1024-based for bs-like)
+def parse_size_like_to_number(v: Any) -> Optional[float]:
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return None
 
-args = parser.parse_args()
+    # already numeric
+    if isinstance(v, (int, float, np.integer, np.floating)) and not isinstance(v, bool):
+        return float(v)
 
-df = pd.read_csv(args.csv)
-
-img_dir = "images"
-
-if os.path.exists(img_dir):
-    shutil.rmtree(img_dir)
-
-os.makedirs(img_dir)
-
-# ---------- sorting helpers ----------
-
-def smart_sort(values):
-
+    s = str(v).strip()
+    # pure int/float string
     try:
-        return sorted(values, key=lambda x: float(str(x).replace("K","000").replace("M","000000")))
-    except:
-        return sorted(values)
+        return float(s)
+    except Exception:
+        pass
 
-groups = smart_sort(df[args.group].unique())
-xvals = smart_sort(df[args.x].unique())
-rows = smart_sort(df[args.row].unique())
-cols = smart_sort(df[args.col].unique())
+    m = SIZE_RE.match(s)
+    if not m:
+        return None
 
-# ---------- y axis range ----------
+    num = float(m.group(1))
+    suf = m.group(2)
+    if not suf:
+        return num
 
-bw_max = df["bw"].max()
-lat_max = df["avg"].max()
+    suf = suf.lower()
+    mult = {
+        "k": 1024.0,
+        "m": 1024.0 ** 2,
+        "g": 1024.0 ** 3,
+        "t": 1024.0 ** 4,
+    }[suf]
+    return num * mult
 
-if args.yscale == "log10":
-    bw_max = np.log10(bw_max)
-    lat_max = np.log10(lat_max)
 
-# ---------- plotting function ----------
+def smart_sorted(values: List[Any]) -> List[Any]:
+    def key_fn(x: Any):
+        n = parse_size_like_to_number(x)
+        if n is not None:
+            return (0, n, str(x))
+        return (1, str(x))
+    return sorted(values, key=key_fn)
 
-def plot_metric(metric, ymax):
 
-    html_rows = []
+# -------------------------
+# Metric transform
+# -------------------------
+def transform_values(vals: np.ndarray, scale: str) -> np.ndarray:
+    vals = np.asarray(vals, dtype=float)
+    if scale == "linear":
+        return vals
+    # log10: keep 0 as 0 (so missing/0 doesn't explode), otherwise log10(v)
+    out = np.zeros_like(vals)
+    mask = vals > 0
+    out[mask] = np.log10(vals[mask])
+    return out
+
+
+# -------------------------
+# Plotting
+# -------------------------
+def plot_grouped_bar(
+    subset: pd.DataFrame,
+    group_col: str,
+    x_col: str,
+    y_col: str,
+    yscale: str,
+    all_groups: List[Any],
+    all_xvals: List[Any],
+    global_ymax: float,
+    title: str,
+    out_png: str,
+    agg: str = "mean",
+):
+    """
+    Make one grouped bar chart for one (row_val, col_val) cell.
+    - group_col: legend group
+    - x_col: x categories
+    - y_col: metric
+    - agg: if duplicates exist for same (group, x), aggregate
+    """
+    if subset.empty:
+        return False
+
+    # aggregate to one value per (group, x)
+    if agg == "mean":
+        pivot = subset.groupby([group_col, x_col], dropna=False)[y_col].mean().reset_index()
+    elif agg == "max":
+        pivot = subset.groupby([group_col, x_col], dropna=False)[y_col].max().reset_index()
+    elif agg == "min":
+        pivot = subset.groupby([group_col, x_col], dropna=False)[y_col].min().reset_index()
+    else:
+        raise ValueError(f"Unsupported agg: {agg}")
+
+    # build matrix [groups x xvals]
+    mat = np.zeros((len(all_groups), len(all_xvals)), dtype=float)
+    lookup: Dict[Tuple[Any, Any], float] = {}
+    for _, r in pivot.iterrows():
+        lookup[(r[group_col], r[x_col])] = float(r[y_col])
+
+    for gi, g in enumerate(all_groups):
+        for xi, xv in enumerate(all_xvals):
+            mat[gi, xi] = lookup.get((g, xv), 0.0)
+
+    mat_t = transform_values(mat, yscale)
+
+    fig, ax = plt.subplots(figsize=(7.2, 4.2))
+    width = 0.82 / max(1, len(all_groups))
+    xbase = np.arange(len(all_xvals), dtype=float)
+
+    for gi, g in enumerate(all_groups):
+        pos = xbase + gi * width
+        ax.bar(pos, mat_t[gi, :], width, label=str(g))
+
+    ax.set_xticks(xbase + width * (len(all_groups) - 1) / 2 if len(all_groups) > 1 else xbase)
+    ax.set_xticklabels([str(v) for v in all_xvals], rotation=0)
+    ax.set_xlabel(x_col)
+
+    if yscale == "linear":
+        ax.set_ylabel(y_col)
+    else:
+        ax.set_ylabel(f"log10({y_col})")
+
+    ax.set_ylim(0, global_ymax)
+    ax.set_title(title)
+    ax.legend(fontsize=8, ncol=min(4, max(1, len(all_groups))))
+
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=140)
+    plt.close(fig)
+    return True
+
+
+def build_html_table(
+    metric_name: str,
+    scale: str,
+    rows: List[Any],
+    cols: List[Any],
+    row_field: str,
+    col_field: str,
+    cell_img: Dict[Tuple[Any, Any], str],
+    out_html: str,
+):
+    html = []
+    html.append("<html><head><meta charset='utf-8'>")
+    html.append("<style>")
+    html.append("table { border-collapse: collapse; }")
+    html.append("th, td { border: 1px solid #999; padding: 6px; vertical-align: top; }")
+    html.append("th { background: #f2f2f2; }")
+    html.append("</style></head><body>")
+    html.append(f"<h2>Metric: {metric_name} &nbsp;&nbsp; Scale: {scale}</h2>")
+    html.append("<table>")
+
+    # header row
+    html.append("<tr>")
+    html.append(f"<th>{row_field} \\ {col_field}</th>")
+    for c in cols:
+        html.append(f"<th>{col_field}={c}</th>")
+    html.append("</tr>")
 
     for r in rows:
-
-        row_html = []
-
-        for c in cols:
-
-            subset = df[(df[args.row]==r) & (df[args.col]==c)]
-
-            if len(subset)==0:
-                row_html.append("")
-                continue
-
-            fig, ax = plt.subplots(figsize=(6,4))
-
-            width = 0.8 / len(groups)
-
-            for i,g in enumerate(groups):
-
-                gdf = subset[subset[args.group]==g]
-
-                ys = []
-
-                for xv in xvals:
-
-                    val = gdf[gdf[args.x]==xv][metric]
-
-                    if len(val)==0:
-                        ys.append(0)
-                    else:
-                        ys.append(val.values[0])
-
-                ys = np.array(ys)
-
-                if args.yscale == "log10":
-                    ys = np.log10(ys)
-
-                pos = np.arange(len(xvals)) + i*width
-
-                ax.bar(pos, ys, width, label=g)
-
-            ax.set_xticks(np.arange(len(xvals)) + width*(len(groups)-1)/2)
-            ax.set_xticklabels(xvals)
-
-            ax.set_ylim(0, ymax)
-
-            ax.set_xlabel(args.x)
-            ax.set_ylabel(metric)
-
-            ax.set_title(f"{args.row}={r}, {args.col}={c}")
-
-            ax.legend()
-
-            fname = f"{img_dir}/{metric}_{args.row}_{r}_{args.col}_{c}.png"
-
-            plt.tight_layout()
-            plt.savefig(fname)
-            plt.close()
-
-            row_html.append(fname)
-
-        html_rows.append(row_html)
-
-    return html_rows
-
-
-bw_imgs = plot_metric("bw", bw_max)
-lat_imgs = plot_metric("avg", lat_max)
-
-# ---------- HTML dashboard ----------
-
-html = []
-
-html.append("<html><body>")
-html.append("<h1>FIO Dashboard</h1>")
-
-def html_table(title, imgs):
-
-    html.append(f"<h2>{title}</h2>")
-    html.append("<table border=1>")
-
-    for r,row in zip(rows,imgs):
-
         html.append("<tr>")
-
-        for img in row:
-
-            if img=="":
-                html.append("<td></td>")
+        html.append(f"<th>{row_field}={r}</th>")
+        for c in cols:
+            img = cell_img.get((r, c))
+            if img:
+                # tooltip shows which cell it is
+                html.append(f"<td><img src='{img}' width='520' title='{row_field}={r}, {col_field}={c}'></td>")
             else:
-                html.append(f"<td><img src='{img}' width=420></td>")
-
+                html.append("<td></td>")
         html.append("</tr>")
 
-    html.append("</table>")
+    html.append("</table></body></html>")
+
+    with open(out_html, "w", encoding="utf-8") as f:
+        f.write("\n".join(html))
 
 
-html_table("Bandwidth (MiB/s)", bw_imgs)
-html_table("Latency avg (usec)", lat_imgs)
+def main():
+    pairs, rest = parse_metric_scale_pairs(sys.argv[1:])
 
-html.append("</body></html>")
+    ap = argparse.ArgumentParser(description="Generate grouped bar charts + HTML dashboard from fio_summary.csv")
+    ap.add_argument("--csv", required=True, help="input CSV")
+    ap.add_argument("--group", required=True, help="group column (legend)")
+    ap.add_argument("--x", required=True, help="x-axis column")
+    ap.add_argument("--row", required=True, help="HTML table row column")
+    ap.add_argument("--col", required=True, help="HTML table col column")
+    ap.add_argument("--outdir", default="images", help="output dir (default: images)")
+    ap.add_argument("--agg", choices=["mean", "max", "min"], default="mean", help="aggregate duplicates (default: mean)")
+    args = ap.parse_args(rest)
 
-with open(f"{img_dir}/dashboard.html","w") as f:
-    f.write("\n".join(html))
+    if not pairs:
+        raise SystemExit("ERROR: you must specify at least one metric set, e.g. --set bw --yscale linear")
 
-print("Dashboard generated:")
-print("images/dashboard.html")
+    df = pd.read_csv(args.csv)
+
+    # validate required columns exist
+    need_cols = {args.group, args.x, args.row, args.col}
+    metric_cols = {m for (m, _) in pairs}
+    missing = [c for c in list(need_cols | metric_cols) if c not in df.columns]
+    if missing:
+        raise SystemExit(f"ERROR: CSV missing columns: {missing}")
+
+    # recreate output dir
+    if os.path.exists(args.outdir):
+        shutil.rmtree(args.outdir)
+    os.makedirs(args.outdir, exist_ok=True)
+
+    # sort axes values numerically (qd/cores/bs will be handled by size parser)
+    all_groups = smart_sorted(df[args.group].dropna().unique().tolist())
+    all_xvals = smart_sorted(df[args.x].dropna().unique().tolist())
+    all_rows = smart_sorted(df[args.row].dropna().unique().tolist())
+    all_cols = smart_sorted(df[args.col].dropna().unique().tolist())
+
+    # For each metric, compute global ymax AFTER transform, so all plots share y-range.
+    # Note: for log10, values <=0 become 0.
+    dashboards = []  # list of (metric, scale, html_path)
+
+    for metric, scale in pairs:
+        vals = df[metric].to_numpy(dtype=float)
+        tvals = transform_values(vals, scale)
+        global_ymax = float(np.nanmax(tvals)) if len(tvals) else 0.0
+        if not np.isfinite(global_ymax):
+            global_ymax = 0.0
+
+        cell_img: Dict[Tuple[Any, Any], str] = {}
+
+        for r in all_rows:
+            for c in all_cols:
+                subset = df[(df[args.row] == r) & (df[args.col] == c)]
+                if subset.empty:
+                    continue
+
+                safe_r = str(r).replace("/", "_")
+                safe_c = str(c).replace("/", "_")
+                out_png = os.path.join(args.outdir, f"{metric}_{scale}_{args.row}_{safe_r}_{args.col}_{safe_c}.png")
+
+                title = f"{args.row}={r}, {args.col}={c}"
+                ok = plot_grouped_bar(
+                    subset=subset,
+                    group_col=args.group,
+                    x_col=args.x,
+                    y_col=metric,
+                    yscale=scale,
+                    all_groups=all_groups,
+                    all_xvals=all_xvals,
+                    global_ymax=global_ymax,
+                    title=title,
+                    out_png=out_png,
+                    agg=args.agg,
+                )
+                if ok:
+                    # store path relative to html (same dir), so just basename is ok
+                    cell_img[(r, c)] = os.path.basename(out_png)
+
+        out_html = os.path.join(args.outdir, f"dashboard_{metric}_{scale}.html")
+        build_html_table(
+            metric_name=metric,
+            scale=scale,
+            rows=all_rows,
+            cols=all_cols,
+            row_field=args.row,
+            col_field=args.col,
+            cell_img=cell_img,
+            out_html=out_html,
+        )
+        dashboards.append((metric, scale, out_html))
+
+    # index page linking all dashboards
+    index = []
+    index.append("<html><head><meta charset='utf-8'></head><body>")
+    index.append("<h1>FIO Dashboards</h1>")
+    index.append("<ul>")
+    for metric, scale, htmlp in dashboards:
+        base = os.path.basename(htmlp)
+        index.append(f"<li><a href='{base}'>metric={metric} scale={scale}</a></li>")
+    index.append("</ul>")
+    index.append("</body></html>")
+
+    with open(os.path.join(args.outdir, "index.html"), "w", encoding="utf-8") as f:
+        f.write("\n".join(index))
+
+    print("Done.")
+    print(f"Open: {os.path.join(args.outdir, 'index.html')}")
+
+
+if __name__ == "__main__":
+    main()
