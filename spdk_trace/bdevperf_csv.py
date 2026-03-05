@@ -41,7 +41,7 @@ def parse_total(filepath):
 
         # runtime iops mib/s fail to avg min max
         bw = float(nums[1])
-        avg = float(nums[5])
+        avg = float(nums[4])
         min_v = float(nums[5])
         max_v = float(nums[6])
 
