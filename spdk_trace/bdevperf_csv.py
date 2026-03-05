@@ -36,18 +36,16 @@ def parse_total(filepath):
 
         nums = re.findall(r"[-+]?\d+\.\d+|\d+", line)
 
-        if len(nums) < 8:
+        if len(nums) < 7:
             continue
 
         # runtime iops mib/s fail to avg min max
-        bw = float(nums[2])
+        bw = float(nums[1])
         avg = float(nums[5])
-        min_v = float(nums[6])
-        max_v = float(nums[7])
+        min_v = float(nums[5])
+        max_v = float(nums[6])
 
         stdev = ""
-        if len(nums) >= 9:
-            stdev = float(nums[8])
 
         return bw, avg, min_v, max_v, stdev
 
