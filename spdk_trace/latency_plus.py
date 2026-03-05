@@ -42,14 +42,16 @@ def row_compact_str(row: Dict[str, str], max_fields: int = 30) -> str:
     items = items[:max_fields]
     return "{" + ", ".join([f"{k}={v}" for k, v in items]) + "}"
 
-# --- Pair types ---
-# root/base event list element: (ts, obj, core)
+# (ts, obj, core)
 EventRec = Tuple[float, str, str]
-# child pair: (rawid, t2, t3, obj, core2, core3, dur)
+# (rawid, t2, t3, obj, core2, core3, dur)
 ChildPair = Tuple[str, float, float, str, str, str, float]
 
+def fmt(x: Optional[float]) -> str:
+    return "" if x is None else f"{x:.6f}"
+
 def main():
-    ap = argparse.ArgumentParser(description="Analyze SPDK trace CSV and compute per-IO step latencies.")
+    ap = argparse.ArgumentParser(description="Analyze SPDK trace CSV and compute per-IO step latencies (agg + per-child).")
     ap.add_argument("csv_in", help="Input CSV produced by your parser")
     ap.add_argument("--output-agg", default="analysis_agg.csv", help="Output CSV (one row per RAID IO, choose slowest child)")
     ap.add_argument("--output-child", default="analysis_child.csv", help="Output CSV (one row per child IO)")
@@ -57,7 +59,7 @@ def main():
                     help="Max allowed time gap (us) when matching root start/done around raid interval (default 5000us)")
     args = ap.parse_args()
 
-    # 讀入所有 rows（保留原始順序、1-based row index）
+    # ---- read all rows ----
     rows: List[Dict[str, str]] = []
     with open(args.csv_in, "r", encoding="utf-8", errors="replace") as f:
         r = csv.DictReader(f)
@@ -66,7 +68,7 @@ def main():
 
     total_rows = len(rows)
 
-    # ✅ 只在我們關注的 4 種 event 裡，找最後一次 id == N/A 的 row index（1-based）
+    # ---- find last N/A row index (focused events only) ----
     FOCUS_EVENTS = {E_BDEV_START, E_BDEV_DONE, E_RAID_START, E_RAID_DONE}
 
     last_na_idx = 0
@@ -81,14 +83,14 @@ def main():
     if last_na_idx > 0:
         info(f"Last N/A row index (1-based, focused events): {last_na_idx}")
         info(f"Last N/A row content: {row_compact_str(last_na_row)}")
-        # 丟掉 (含 N/A 那行) 之前的
+        # drop rows <= last_na_idx
         rows = rows[last_na_idx:]
         info(f"Rows kept for analysis: {len(rows)} (starting from original row {last_na_idx + 1})")
     else:
         info("No N/A id row found (within focused events). Analyze all rows.")
         info(f"Rows kept for analysis: {len(rows)}")
 
-    # 過濾必備欄位 + 避免殘留 N/A
+    # ---- basic filter ----
     filtered: List[Dict[str, str]] = []
     for row in rows:
         if not row.get("core") or not row.get("ts") or not row.get("event_type"):
@@ -97,26 +99,30 @@ def main():
             continue
         filtered.append(row)
 
-    # 防呆：同一個 raw id + event_type 出現多次（限我們關心的 4 類事件）
+    # ---- duplicate check (focused events only) ----
     cnt = defaultdict(int)
     for row in filtered:
         rid = (row.get("id") or "").strip()
         evt = (row.get("event_type") or "").strip()
-        if rid and evt in (E_BDEV_START, E_BDEV_DONE, E_RAID_START, E_RAID_DONE):
+        if rid and evt in FOCUS_EVENTS:
             cnt[(rid, evt)] += 1
     for (rid, evt), c in cnt.items():
         if c > 1:
             warn(f"Duplicate event for same raw id: id='{rid}' event='{evt}' count={c}")
 
-    # --- 收集事件 ---
+    # ---- collect events ----
     raid_start: Dict[str, Tuple[float, str]] = {}
     raid_done:  Dict[str, Tuple[float, str]] = {}
 
-    # BDEV events：用 raw id 字串當 key（可能是 "i1314 (R5917)" 或 "i30 (u6)" 或 "i30"）
+    # BDEV events by raw id
     bdev_starts_by_rawid: Dict[str, List[EventRec]] = defaultdict(list)
     bdev_dones_by_rawid:  Dict[str, List[EventRec]] = defaultdict(list)
 
-    # 索引：raid_main -> bdev rawid candidates where rawid has "(raid_main)"
+    # ✅ NEW: BDEV events by id_main (to match parent i30 vs i30 (u6))
+    bdev_starts_by_main: Dict[str, List[EventRec]] = defaultdict(list)
+    bdev_dones_by_main:  Dict[str, List[EventRec]] = defaultdict(list)
+
+    # raid_main -> set(rawid) where rawid has "(raid_main)" (child IOs)
     bdev_rawids_by_raid = defaultdict(set)
 
     for row in filtered:
@@ -129,44 +135,58 @@ def main():
         core = (row.get("core") or "").strip()
 
         if evt in (E_RAID_START, E_RAID_DONE):
-            raid_main, _raid_paren = parse_id(rawid)  # "Rxxxx (iYYYY)" => main=Rxxxx
+            raid_main, _paren = parse_id(rawid)  # "Rxxxx (iYYYY)" => main=Rxxxx
             if evt == E_RAID_START:
                 raid_start[raid_main] = (ts, rawid)
             else:
                 raid_done[raid_main] = (ts, rawid)
 
         elif evt == E_BDEV_START:
-            if rawid:
-                bdev_starts_by_rawid[rawid].append((ts, obj, core))
-                _main, paren = parse_id(rawid)
-                if paren and paren.startswith("R"):
-                    bdev_rawids_by_raid[paren].add(rawid)
+            if not rawid:
+                continue
+            bdev_starts_by_rawid[rawid].append((ts, obj, core))
+
+            main, paren = parse_id(rawid)
+            if main:
+                bdev_starts_by_main[main].append((ts, obj, core))
+
+            if paren and paren.startswith("R"):
+                bdev_rawids_by_raid[paren].add(rawid)
 
         elif evt == E_BDEV_DONE:
-            if rawid:
-                bdev_dones_by_rawid[rawid].append((ts, obj, core))
-                _main, paren = parse_id(rawid)
-                if paren and paren.startswith("R"):
-                    bdev_rawids_by_raid[paren].add(rawid)
+            if not rawid:
+                continue
+            bdev_dones_by_rawid[rawid].append((ts, obj, core))
 
-    # sort
-    for rid in bdev_starts_by_rawid:
-        bdev_starts_by_rawid[rid].sort(key=lambda x: x[0])
-    for rid in bdev_dones_by_rawid:
-        bdev_dones_by_rawid[rid].sort(key=lambda x: x[0])
+            main, paren = parse_id(rawid)
+            if main:
+                bdev_dones_by_main[main].append((ts, obj, core))
 
-    # --- root matching ---
+            if paren and paren.startswith("R"):
+                bdev_rawids_by_raid[paren].add(rawid)
+
+    # sort all lists
+    for k in bdev_starts_by_rawid:
+        bdev_starts_by_rawid[k].sort(key=lambda x: x[0])
+    for k in bdev_dones_by_rawid:
+        bdev_dones_by_rawid[k].sort(key=lambda x: x[0])
+
+    for k in bdev_starts_by_main:
+        bdev_starts_by_main[k].sort(key=lambda x: x[0])
+    for k in bdev_dones_by_main:
+        bdev_dones_by_main[k].sort(key=lambda x: x[0])
+
+    # ---- root matching ----
     # 你要求：若有多組候選 (t0,t5)，用 dur=(t5-t0) 取最大
     def find_root_times(parent_id: str, t1: float, t4: float, max_gap: float) -> Tuple[Optional[float], Optional[float], str, str, str]:
         """
-        returns (t0, t5, root_obj, core_at_start, core_at_done)
+        returns (t0, t5, root_obj, core0, core5)
+        Matching uses id_main aggregation (so parent i30 matches rawid i30 and i30(u6)).
         """
-        starts = bdev_starts_by_rawid.get(parent_id, [])
-        dones  = bdev_dones_by_rawid.get(parent_id, [])
+        starts = bdev_starts_by_main.get(parent_id, [])
+        dones  = bdev_dones_by_main.get(parent_id, [])
 
-        # 候選：t0 必須 <= t1 且 (t1-t0)<=max_gap
         cand_t0 = [(ts, obj, core) for (ts, obj, core) in starts if ts <= t1 and (t1 - ts) <= max_gap]
-        # 候選：t5 必須 >= t4 且 (t5-t4)<=max_gap
         cand_t5 = [(ts, obj, core) for (ts, obj, core) in dones  if ts >= t4 and (ts - t4) <= max_gap]
 
         if not cand_t0 or not cand_t5:
@@ -177,20 +197,17 @@ def main():
             for (t5, obj5, core5) in cand_t5:
                 if t5 < t0:
                     continue
-                dur = t5 - t0  # ✅ 用 t5-t0 比較久或短
-                # 取最大 dur
+                dur = t5 - t0
                 if best is None or dur > best[0]:
                     obj = obj0 or obj5
                     best = (dur, t0, t5, obj, core0, core5)
 
         if best is None:
             return None, None, "", "", ""
-
         _, t0, t5, obj, core0, core5 = best
         return t0, t5, obj, core0, core5
 
-    # --- child pairing ---
-    # 對某 raid_main：列出所有 child pairs（每個 child rawid 可能 1 組）
+    # ---- child pairing ----
     def get_child_pairs_for_raid(raid_main: str, t1: float, t4: float) -> List[ChildPair]:
         pairs: List[ChildPair] = []
         candidates = list(bdev_rawids_by_raid.get(raid_main, set()))
@@ -203,11 +220,10 @@ def main():
             if not starts or not dones:
                 continue
 
-            # 逐 start 找最早的 done >= start 且在 raid interval 內
             for (t2, obj2, core2) in starts:
                 if not (t1 <= t2 <= t4):
                     continue
-                chosen = None  # (t3,obj3,core3)
+                chosen = None
                 for (t3, obj3, core3) in dones:
                     if t3 < t2:
                         continue
@@ -224,11 +240,7 @@ def main():
 
         return pairs
 
-    def fmt(x: Optional[float]) -> str:
-        return "" if x is None else f"{x:.6f}"
-
-    # -------------------- outputs --------------------
-    # Agg：每個 raid 一行（base=最久 child）
+    # ---- output schemas ----
     agg_fields = [
         "raid_id",
         "parent_bdev_id",
@@ -236,7 +248,7 @@ def main():
         "root_core_start",
         "root_core_done",
         "num_children",
-        "base_bdev_id",         # ✅ 取最久 child 的 rawid，例如 i31 (R6)
+        "base_bdev_id",         # slowest child rawid (max t3-t2)
         "base_obj",
         "base_core_start",
         "base_core_done",
@@ -253,10 +265,9 @@ def main():
         "step5_t5_minus_t4",
         "lat_root_bdev",
         "lat_raid",
-        "lat_base_bdev",        # ✅ 取最久 child 的 dur
+        "lat_base_bdev",
     ]
 
-    # Child：每個 child 一行
     child_fields = [
         "raid_id",
         "parent_bdev_id",
@@ -294,26 +305,23 @@ def main():
             continue
         t4, _raid_rawid_done = raid_done[raid_main]
 
-        # parent_id: "Rxxxx (iYYYY)" -> parent=iYYYY
+        # parent id from "Rxxx (iYYY)" -> iYYY
         _main, parent_id = parse_id(raid_rawid_start)
         parent_id = parent_id or ""
         if not parent_id:
             warn(f"RAID '{raid_main}': raid start id has no '(parent_id)': '{raid_rawid_start}'")
 
-        # root times + cores (choose max dur=t5-t0 if ambiguous)
         t0, t5, root_obj, root_core0, root_core5 = (None, None, "", "", "")
         if parent_id:
             t0, t5, root_obj, root_core0, root_core5 = find_root_times(parent_id, t1, t4, args.max_gap_us)
 
-        # child pairs for this raid
-        pairs = get_child_pairs_for_raid(raid_main, t1, t4)
-
         if t0 is None or t5 is None:
             warn(f"RAID '{raid_main}': cannot find root bdev start/done by parent_id='{parent_id}' within max_gap={args.max_gap_us}us")
 
+        pairs = get_child_pairs_for_raid(raid_main, t1, t4)
+
         if not pairs:
             warn(f"RAID '{raid_main}': cannot find any child base bdev pairs bound to '( {raid_main} )' inside raid interval")
-            # 仍可輸出 agg 一行（child 空）方便你追
             agg_rows.append({
                 "raid_id": raid_main,
                 "parent_bdev_id": parent_id,
@@ -342,8 +350,9 @@ def main():
             })
             continue
 
-        # --- per-child output ---
         pairs_sorted = sorted(pairs, key=lambda x: x[1])  # by t2
+
+        # per-child rows
         for idx, (rawid, t2, t3, obj, core2, core3, dur) in enumerate(pairs_sorted, start=1):
             child_rows.append({
                 "raid_id": raid_main,
@@ -373,8 +382,7 @@ def main():
                 "lat_child_bdev": f"{dur:.6f}",
             })
 
-        # --- agg output: choose slowest child (max dur=t3-t2) ---
-        # 若有多個同 dur，取 t3 最晚者（更貼近阻塞者）
+        # agg row chooses slowest child (max dur=t3-t2), tie-break by latest t3
         slowest = max(pairs, key=lambda x: (x[6], x[2]))
         base_rawid, t2, t3, base_obj, base_core2, base_core3, base_dur = slowest
 
@@ -405,14 +413,13 @@ def main():
             "lat_base_bdev": f"{base_dur:.6f}",
         })
 
-    # write agg
+    # write outputs
     with open(args.output_agg, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=agg_fields)
         w.writeheader()
         for r in agg_rows:
             w.writerow(r)
 
-    # write child
     with open(args.output_child, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=child_fields)
         w.writeheader()
