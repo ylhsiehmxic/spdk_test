@@ -274,7 +274,7 @@ def main():
         "root_obj",
         "root_core_start",
         #"root_core_done",
-        "child_index",
+        #"child_index",
         "child_bdev_id",
         "child_obj",
         "child_core_start",
