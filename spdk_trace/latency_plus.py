@@ -354,16 +354,16 @@ def main():
         # per-child rows
         for idx, (rawid, t2, t3, obj, core2, core3, dur) in enumerate(pairs_sorted, start=1):
             child_rows.append({
-                "raid_id": raid_main,
                 "parent_bdev_id": parent_id,
+                "raid_id": raid_main,
                 "root_obj": root_obj,
                 "root_core_start": root_core0,
-                "root_core_done": root_core5,
-                "child_index": str(idx),
+                #"root_core_done": root_core5,
+                # "child_index": str(idx),
                 "child_bdev_id": rawid,
                 "child_obj": obj,
                 "child_core_start": core2,
-                "child_core_done": core3,
+                #"child_core_done": core3,
                 "t0_root_bdev_start": fmt(t0),
                 "t1_raid_start": fmt(t1),
                 "t2_child_bdev_start": fmt(t2),
