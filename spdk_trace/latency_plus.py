@@ -53,7 +53,7 @@ def fmt(x: Optional[float]) -> str:
 def main():
     ap = argparse.ArgumentParser(description="Analyze SPDK trace CSV and compute per-IO step latencies (agg + per-child).")
     ap.add_argument("csv_in", help="Input CSV produced by your parser")
-    ap.add_argument("--output-agg", default="analysis_agg.csv", help="Output CSV (one row per RAID IO, choose slowest child)")
+    ap.add_argument("--output-agg", default=None, help="Output CSV (one row per RAID IO, choose slowest child)")
     ap.add_argument("--output-child", default="analysis_child.csv", help="Output CSV (one row per child IO)")
     ap.add_argument("--max-gap-us", type=float, default=5000.0,
                     help="Max allowed time gap (us) when matching root start/done around raid interval (default 5000us)")
@@ -412,11 +412,12 @@ def main():
         })
 
     # write outputs
-    with open(args.output_agg, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=agg_fields)
-        w.writeheader()
-        for r in agg_rows:
-            w.writerow(r)
+    if args.output_agg:
+        with open(args.output_agg, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=agg_fields)
+            w.writeheader()
+            for r in agg_rows:
+                w.writerow(r)
 
     with open(args.output_child, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=child_fields)
@@ -424,7 +425,8 @@ def main():
         for r in child_rows:
             w.writerow(r)
 
-    print(f"[OK] Wrote {len(agg_rows)} RAID records to {args.output_agg}")
+    if args.output_agg:
+        print(f"[OK] Wrote {len(agg_rows)} RAID records to {args.output_agg}")
     print(f"[OK] Wrote {len(child_rows)} child records to {args.output_child}")
 
 if __name__ == "__main__":
