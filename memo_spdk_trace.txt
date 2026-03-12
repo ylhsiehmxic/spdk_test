@@ -1,0 +1,75 @@
+bdev
+	spdk_trace_register_owner_type(OWNER_TYPE_BDEV, 'b');
+	spdk_trace_register_object(OBJECT_BDEV_IO, 'i');
+
+
+raid
+	No Owner
+	spdk_trace_register_object(OBJECT_BDEV_RAID_IO, 'R');
+
+
+想看「是哪個裝置/哪個 instance 在發事件」→ owner 很適合
+想追「同一筆 I/O 的生命週期跨層關聯」→ object + relation 很適合（你之前要的 i9762 (u1136) 就偏這個）
+
+
+
+帶1或0的意思是？ new_object=0 or 1
+1: 是否「建立一個新的 object instance」(會被當成 一個新 object 的起點, 例如產生一個新的 BDEV_IO 物件 id = 9762) 
+  - 但並非指 整條 IO 的起點
+0: 這個事件只是「使用既有的 object」
+static void
+bdev_trace(void)
+{
+	struct spdk_trace_tpoint_opts opts[] = {
+		{
+			"BDEV_IO_START", TRACE_BDEV_IO_START,
+			OWNER_TYPE_BDEV, OBJECT_BDEV_IO, 1,
+			{
+				{ "type", SPDK_TRACE_ARG_TYPE_INT, 8 },
+				{ "ctx", SPDK_TRACE_ARG_TYPE_PTR, 8 },
+				{ "offset", SPDK_TRACE_ARG_TYPE_INT, 8 },
+				{ "qd", SPDK_TRACE_ARG_TYPE_INT, 4 }
+			}
+		},
+		{
+			"BDEV_IO_DONE", TRACE_BDEV_IO_DONE,
+			OWNER_TYPE_BDEV, OBJECT_BDEV_IO, 0,
+			{
+				{ "ctx", SPDK_TRACE_ARG_TYPE_PTR, 8 },
+				{ "qd", SPDK_TRACE_ARG_TYPE_INT, 4 }
+			}
+		},
+
+[該填0或1, 判斷方式]
+是不是這層 new 出來的一個新的 IO struct？	是 → new_object = 1
+只是同一個 IO struct 的另一個階段？	是 → new_object = 0
+
+
+用 lifecycle 看就更清楚...
+對 BDEV_IO：
+BDEV_IO_START   ← new_object = 1
+BDEV_IO_SPLIT   ← new_object = 0
+BDEV_IO_SUBMIT  ← new_object = 0
+BDEV_IO_DONE    ← new_object = 0
+
+
+每一層：
+都會 new 一個自己的 IO struct
+都會 new 一個自己的 trace object
+都會 new_object = 1
+然後用：
+spdk_trace_tpoint_register_relation()
+把 parent object 和 child object 串起來。
+
+
+spdk_trace_tpoint_register_relation()的第三個參數, 0或1, 什麼意思呢
+原程式：
+bdev:
+	spdk_trace_tpoint_register_relation(TRACE_BDEV_NVME_IO_START, OBJECT_BDEV_IO, 0);
+	spdk_trace_tpoint_register_relation(TRACE_BDEV_RAID_IO_START, OBJECT_BDEV_IO, 0);
+raid:
+	spdk_trace_tpoint_register_relation(TRACE_BDEV_IO_START, OBJECT_BDEV_RAID_IO, 1);
+答：
+例如spdk_trace_tpoint_register_relation(TRACE_BDEV_RAID_IO_START, OBJECT_BDEV_IO, 0);
+前者這個 event 的第 0 個 argument 是後者的 object id
+
